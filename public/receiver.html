@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vision Assistant - Receiver</title>
+    <style>
+        body {
+            margin: 20px;
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            text-align: center;
+        }
+        video {
+            width: 100%;
+            max-width: 640px;
+            border: 3px solid #333;
+            border-radius: 8px;
+            background: #000;
+        }
+        #status {
+            padding: 10px;
+            background: #fff;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        #detections {
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 10px;
+            text-align: left;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Vision Assistant - Processing Server</h2>
+        <video id="remoteVideo" autoplay playsinline muted></video>
+        <div id="status">Connecting...</div>
+        <div id="detections"><strong>Results:</strong> <span id="detectedText">None</span></div>
+    </div>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        let pc;
+        let dataChannel;
+        let isProcessingFrame = false;
+        let frameInterval;
+        let currentMode = 'detection';
+        const detectedText = document.getElementById("detectedText");
+
+        const connectionState = {
+            signaling: 'connecting',
+            ice: 'pending',
+            track: 'waiting'
+        };
+
+        const config = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        function updateStatus() {
+            document.getElementById('status').innerHTML = `
+                Signaling: ${connectionState.signaling.toUpperCase()}<br>
+                ICE: ${connectionState.ice.toUpperCase()}<br>
+                Track: ${connectionState.track.toUpperCase()}
+            `;
+        }
+
+        async function extractAndProcessFrame() {
+            if (isProcessingFrame) return;
+            isProcessingFrame = true;
+
+            try {
+                const video = document.getElementById('remoteVideo');
+                const canvas = document.createElement("canvas");
+                const context = canvas.getContext('2d');
+
+                if (video.videoWidth === 0 || video.videoHeight === 0) return;
+
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                const blob = await new Promise(resolve =>
+                    canvas.toBlob(resolve, 'image/jpeg', 0.7)
+                );
+
+                const formData = new FormData();
+                formData.append('frame', blob, 'frame.jpg');
+
+                const endpoint = currentMode === 'ocr' ? 'http://127.0.0.1:5001/ocr' : 'http://127.0.0.1:5000/detect';
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                const results = await response.json();
+
+                if (currentMode === 'ocr') {
+                    detectedText.innerHTML = results.text || "No text detected";
+                } else {
+                    detectedText.innerHTML = results.boxes?.length > 0 
+                        ? results.boxes.map(box => `${box.label} (${Math.round(box.confidence * 100)}%)`).join(", ")
+                        : "None";
+                }
+
+                if (dataChannel?.readyState === 'open') {
+                    dataChannel.send(JSON.stringify(results));
+                }
+            } catch (error) {
+                console.error('Processing error:', error);
+            } finally {
+                isProcessingFrame = false;
+            }
+        }
+
+        socket.on('connect', () => {
+            connectionState.signaling = 'connected';
+            socket.emit('register_role', 'receiver');
+            updateStatus();
+        });
+
+        socket.on('disconnect', () => {
+            connectionState.signaling = 'disconnected';
+            updateStatus();
+        });
+
+        socket.on('signal', async (data) => {
+            try {
+                if (!pc) initConnection();
+                if (data.offer) {
+                    await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    socket.emit('signal', { answer });
+                } else if (data.candidate) {
+                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                }
+            } catch (error) {
+                console.error('Signal error:', error);
+                connectionState.signaling = 'error';
+                updateStatus();
+            }
+        });
+
+        function initConnection() {
+            pc = new RTCPeerConnection(config);
+
+            pc.ontrack = (event) => {
+                const video = document.getElementById('remoteVideo');
+                connectionState.track = 'received';
+                updateStatus();
+                video.srcObject = event.streams[0];
+                video.play().catch(err => {
+                    console.error('Video playback failed:', err);
+                    connectionState.track = 'playback error';
+                    updateStatus();
+                });
+
+                video.onplaying = () => {
+                    frameInterval = setInterval(extractAndProcessFrame, 700);
+                };
+
+                video.onended = () => {
+                    clearInterval(frameInterval);
+                };
+            };
+
+            pc.ondatachannel = (event) => {
+                dataChannel = event.channel;
+                dataChannel.onopen = () => {
+                    connectionState.ice = 'connected';
+                    updateStatus();
+                };
+                dataChannel.onclose = () => {
+                    connectionState.ice = 'disconnected';
+                    updateStatus();
+                };
+                dataChannel.onmessage = (e) => {
+                    try {
+                        const data = JSON.parse(e.data);
+                        if (data.mode) {
+                            currentMode = data.mode;
+                            console.log('Switched to mode:', currentMode);
+                            // Clear previous results when switching modes
+                            detectedText.innerHTML = currentMode === 'ocr' ? 'Waiting for text...' : 'Waiting for detections...';
+                        }
+                    } catch (error) {
+                        console.error('Error processing message:', error);
+                    }
+                };
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('signal', { candidate: event.candidate });
+                }
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                connectionState.ice = pc.iceConnectionState;
+                updateStatus();
+                if (pc.iceConnectionState === 'disconnected') {
+                    clearInterval(frameInterval);
+                }
+            };
+        }
+
+        updateStatus();
+    </script>
+</body>
+</html>

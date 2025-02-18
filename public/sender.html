@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Vision Assistant - Mobile Client</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        video {
+            width: 100%;
+            max-width: 640px;
+            border: 3px solid #333;
+            border-radius: 8px;
+            margin: 10px 0;
+        }
+        #results {
+            margin-top: 15px;
+            padding: 15px;
+            background: #fff;
+            border-radius: 8px;
+            min-height: 50px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .detection {
+            color: #2c3e50;
+            font-weight: bold;
+            margin: 8px 0;
+            padding: 5px;
+            border-left: 3px solid #3498db;
+            background: #f8f9fa;
+        }
+        .mode-switch {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 10px 0;
+            font-size: 16px;
+        }
+        .mode-switch:hover {
+            background: #2980b9;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Vision Assistant - Mobile Client</h2>
+        <button id="modeSwitch" class="mode-switch">Switch to OCR Mode</button>
+        <video id="localVideo" autoplay playsinline></video>
+        <div id="results">Waiting for detections...</div>
+    </div>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        let pc;
+        let dataChannel;
+        let lastSpokenText = '';
+        let lastDetections = '';
+        let isOCRMode = false;
+        let speakTimeout = null;
+
+        const config = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        // Stop all ongoing speech and clear timeouts
+        function stopEverything() {
+            window.speechSynthesis.cancel();
+            if (speakTimeout) {
+                clearTimeout(speakTimeout);
+                speakTimeout = null;
+            }
+            lastSpokenText = '';
+            lastDetections = '';
+        }
+
+        // Mode switch handler
+        document.getElementById('modeSwitch').addEventListener('click', function() {
+            stopEverything();
+            isOCRMode = !isOCRMode;
+            this.textContent = isOCRMode ? 'Switch to Object Detection' : 'Switch to OCR Mode';
+            document.getElementById('results').innerHTML = isOCRMode ? 'Waiting for text...' : 'Waiting for detections...';
+            if (dataChannel?.readyState === 'open') {
+                dataChannel.send(JSON.stringify({ mode: isOCRMode ? 'ocr' : 'detection' }));
+            }
+        });
+
+        function speakText(text) {
+            if (!text || window.speechSynthesis.speaking) return;
+            
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'en-US';
+            utterance.rate = 1.0;
+            window.speechSynthesis.speak(utterance);
+        }
+
+        function displayResults(results) {
+            try {
+                if (typeof results === 'string') {
+                    results = JSON.parse(results);
+                }
+
+                const resultsDiv = document.getElementById('results');
+
+                // Handle OCR Mode
+                if (results.text !== undefined && isOCRMode) {
+                    const text = results.text;
+                    if (text && text !== "No text detected" && text !== lastSpokenText) {
+                        resultsDiv.innerHTML = `<div class="detection">📝 ${text}</div>`;
+                        lastSpokenText = text;
+                        speakText("Text detected: " + text);
+                    }
+                }
+                // Handle Detection Mode
+                else if (results.detections && !isOCRMode) {
+                    const detectionsString = results.detections.sort().join(',');
+                    if (detectionsString !== lastDetections && results.detections.length > 0) {
+                        resultsDiv.innerHTML = results.detections
+                            .map(detection => `<div class="detection">📸 ${detection}</div>`)
+                            .join('');
+                        
+                        lastDetections = detectionsString;
+                        if (speakTimeout) clearTimeout(speakTimeout);
+                        
+                        speakTimeout = setTimeout(() => {
+                            speakText("Detected: " + results.detections.join(', '));
+                        }, 500);
+                    }
+                }
+            } catch (e) {
+                console.error('Results display error:', e);
+            }
+        }
+
+        async function start() {
+            try {
+                socket.emit('register_role', 'sender');
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'environment',
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    },
+                    audio: false
+                });
+                document.getElementById('localVideo').srcObject = stream;
+
+                pc = new RTCPeerConnection(config);
+                stream.getTracks().forEach(track => pc.addTrack(track, stream));
+                
+                dataChannel = pc.createDataChannel('results');
+                dataChannel.onopen = () => console.log('Data channel ready');
+                dataChannel.onmessage = e => displayResults(e.data);
+
+                pc.onicecandidate = e => {
+                    if (e.candidate) {
+                        socket.emit('signal', { candidate: e.candidate });
+                    }
+                };
+
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                socket.emit('signal', { offer });
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Camera access failed! Please ensure permissions are granted.');
+            }
+        }
+
+        socket.on('signal', async data => {
+            try {
+                if (data.answer) {
+                    await pc.setRemoteDescription(data.answer);
+                } else if (data.candidate) {
+                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                }
+            } catch (error) {
+                console.error('Signal error:', error);
+            }
+        });
+
+        // Stop everything when page is hidden
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                stopEverything();
+            }
+        });
+
+        start();
+    </script>
+</body>
+</html>

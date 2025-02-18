@@ -1,0 +1,27 @@
+{
+  "name": "nexvision3",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "compression": "^1.8.0",
+    "express": "^4.21.2",
+    "http-proxy-middleware": "^3.0.3",
+    "socket.io": "^4.8.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Beastop33/Nexvision.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Beastop33/Nexvision/issues"
+  },
+  "homepage": "https://github.com/Beastop33/Nexvision#readme",
+  "description": ""
+}
